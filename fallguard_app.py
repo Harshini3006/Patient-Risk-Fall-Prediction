@@ -101,6 +101,16 @@ def init_db():
         timestamp     TEXT
     )""")
 
+    c.execute("""CREATE TABLE IF NOT EXISTS messages (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        patient_id      TEXT NOT NULL,
+        sender_username TEXT NOT NULL,
+        receiver_username TEXT NOT NULL,
+        message         TEXT NOT NULL,
+        is_instruction  INTEGER DEFAULT 0,
+        timestamp       TEXT
+    )""")
+
     # Seed users (admin + team)
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     demo_users = [
@@ -127,6 +137,17 @@ def init_db():
         c.execute("""INSERT OR IGNORE INTO patients
             (patient_id,name,age,room_type,assigned_to,assigned_by,created_at)
             VALUES (?,?,?,?,?,?,?)""", (*d, ts))
+
+    # Repair existing demo patients created before assigned_by column existed
+    repair_map = {
+        'P001': 'dr.smith', 'P002': 'dr.smith',
+        'P003': 'dr.jones', 'P004': 'dr.jones'
+    }
+    for pid, doc in repair_map.items():
+        c.execute("""
+            UPDATE patients SET assigned_by = ?
+            WHERE patient_id = ? AND (assigned_by IS NULL OR assigned_by = '')
+        """, (doc, pid))
 
     # Seed demo predictions to populate the dashboard (only if table is empty)
     c.execute("SELECT COUNT(*) FROM predictions")
@@ -549,6 +570,21 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
 .muted{color:var(--gr5);font-size:12px}
 .empty{text-align:center;padding:32px;color:var(--gr5);font-size:14px}
 .loading-row{text-align:center;padding:24px;color:var(--gr5)}
+
+/* ── Messaging ── */
+.msg-thread{max-height:400px;overflow-y:auto;padding:10px;border:1px solid var(--gr3);border-radius:8px;background:var(--b0)}
+.msg{margin-bottom:12px;padding:10px;border-radius:8px;max-width:80%}
+.msg-sent{background:var(--b5);color:#fff;margin-left:auto;text-align:right}
+.msg-recv{background:var(--wh);border:1px solid var(--gr3);margin-right:auto;text-align:left}
+.msg-hdr{display:flex;justify-content:space-between;font-size:11px;margin-bottom:4px}
+.msg-hdr strong{font-weight:600}
+.msg-body{font-size:13px}
+.pinned-note{background:#fff3cd;border:1px solid #ffeaa7;border-radius:6px;padding:10px 12px;margin-bottom:12px;font-size:13px}
+.pinned-note i{color:#d69e2e;margin-right:6px}
+.pinned-note-card{background:#fff3cd;border:1px solid #ffeaa7;border-radius:6px;padding:8px 10px;margin-top:8px;font-size:12px}
+.pinned-note-card i{color:#d69e2e;margin-right:4px}
+.sm-purple{background:#e9d5ff;color:#6b21a8}
+.sm-purple:hover{background:#d8b4fe}
 </style>
 """
 
@@ -561,11 +597,13 @@ def nav(active=""):
         links = [("/admin","fa-crown","Dashboard")]
     elif role == "Doctor":
         links = [("/doctor","fa-th-large","Dashboard"),
+                 ("/messages","fa-comments","Messages"),
                  ("/sensor","fa-microchip","Sensor Input"),
                  ("/history","fa-history","History"),
                  ("/analytics","fa-chart-bar","Analytics")]
     else:
         links = [("/nurse","fa-th-large","Dashboard"),
+                 ("/messages","fa-comments","Messages"),
                  ("/sensor","fa-microchip","Sensor Input"),
                  ("/history","fa-history","History")]
 
@@ -852,6 +890,9 @@ def doctor():
           <a href="/sensor?pid={p['patient_id']}" class="sm-btn sm-blue">
             <i class="fas fa-microchip"></i> Monitor
           </a>
+          <a href="/messages/{p['patient_id']}" class="sm-btn sm-purple">
+            <i class="fas fa-comments"></i> Messages
+          </a>
         </td>
       </tr>""" for p in patients)
 
@@ -1026,6 +1067,19 @@ def nurse():
         ORDER BY p.timestamp DESC LIMIT 20
     """, (session["username"],)).fetchall()
     
+    # Get pinned instructions for each patient
+    pinned_instructions = {}
+    for p in my_pts:
+        instr = db.execute("""
+            SELECT m.message, m.timestamp, u.name as doctor_name
+            FROM messages m
+            JOIN users u ON m.sender_username = u.username
+            WHERE m.patient_id = ? AND m.is_instruction = 1 AND u.role = 'Doctor'
+            ORDER BY m.timestamp DESC LIMIT 1
+        """, (p['patient_id'],)).fetchone()
+        if instr:
+            pinned_instructions[p['patient_id']] = instr
+    
     # Count patients by their LATEST risk level for assigned patients
     high_risk_count = db.execute("""
         SELECT COUNT(*) FROM (
@@ -1084,10 +1138,14 @@ def nurse():
           <p>ID: <strong>{p['patient_id']}</strong></p>
           <p>Age: {p['age']} &nbsp;|&nbsp; Room: {p['room_type']}</p>
           <p>Assigned by: <strong>{p['doctor_name'] or 'Unknown'}</strong></p>
+          {f'<div class="pinned-note-card"><i class="fas fa-thumbtack"></i> <strong>Instructions:</strong> {pinned_instructions[p["patient_id"]]["message"]}</div>' if p['patient_id'] in pinned_instructions else ''}
         </div>
         <div class="pt-actions">
           <a href="/sensor?pid={p['patient_id']}" class="sm-btn sm-blue">
             <i class="fas fa-microchip"></i> Monitor
+          </a>
+          <a href="/messages/{p['patient_id']}" class="sm-btn sm-purple">
+            <i class="fas fa-comments"></i> Messages
           </a>
           <a href="/history?pid={p['patient_id']}" class="sm-btn sm-grey">
             <i class="fas fa-history"></i> History
@@ -1169,6 +1227,57 @@ def nurse():
     </script>
     """
     return page("Nurse Dashboard", body, active="/nurse")
+
+@app.route("/messages")
+@login_required
+def messages_index():
+    db = get_db()
+    user = session["username"]
+    role = session["role"]
+    if role == 'Doctor':
+        patients = db.execute("""
+            SELECT p.*, u.name AS nurse_name FROM patients p
+            LEFT JOIN users u ON p.assigned_to = u.username
+        """).fetchall()
+    elif role == 'Nurse':
+        patients = db.execute("""
+            SELECT p.*, u.name AS doctor_name FROM patients p
+            LEFT JOIN users u ON p.assigned_by = u.username
+            WHERE p.assigned_to = ?
+        """, (user,)).fetchall()
+    else:
+        patients = []
+    db.close()
+
+    pt_html = "".join(f"""
+      <div class="pt-card">
+        <div class="pt-avatar"><i class="fas fa-user"></i></div>
+        <div class="pt-info">
+          <h4>{p['name']}</h4>
+          <p>ID: <strong>{p['patient_id']}</strong></p>
+          <p>Age: {p['age']} &nbsp;|&nbsp; Room: {p['room_type']}</p>
+          <p>{'Assigned nurse:' if role=='Doctor' else 'Assigned doctor:'}
+             <strong>{p['nurse_name'] if role=='Doctor' else p['doctor_name'] or 'Unknown'}</strong></p>
+        </div>
+        <div class="pt-actions">
+          <a href="/messages/{p['patient_id']}" class="sm-btn sm-purple">
+            <i class="fas fa-comments"></i> Open Messages
+          </a>
+        </div>
+      </div>""" for p in patients) or \
+      '<p class="empty">No patients available for messaging.</p>'
+
+    body = f"""
+    <div class="page-hdr">
+      <h2><i class="fas fa-comments"></i> Patient Messages</h2>
+      <p class="subtitle">Open the conversation for any patient assigned to you.</p>
+    </div>
+    <div class="panel">
+      <div class="panel-hdr"><i class="fas fa-hospital-user"></i> Messages by Patient</div>
+      <div class="panel-body"><div class="pt-grid">{pt_html}</div></div>
+    </div>
+    """
+    return page("Messages", body, active="/messages")
 
 # ══════════════════════════════════════════════════════════════════════
 # SECTION 11 – ROUTE: SENSOR INPUT & PREDICTION
@@ -2320,6 +2429,174 @@ def api_alerts_csv():
     
     return __import__('flask').Response(csv_data, mimetype='text/csv',
                                       headers={"Content-Disposition":"attachment;filename=alert_log.csv"})
+
+# ══════════════════════════════════════════════════════════════════════
+# SECTION 12 – MESSAGING FEATURES
+# ══════════════════════════════════════════════════════════════════════
+
+@app.route("/messages/<patient_id>")
+@login_required
+def messages(patient_id):
+    """View messages for a specific patient."""
+    db = get_db()
+    # Check if user has access to this patient
+    user = session['username']
+    role = session['role']
+    if role == 'Nurse':
+        patient = db.execute("SELECT * FROM patients WHERE patient_id=? AND assigned_to=?", (patient_id, user)).fetchone()
+    elif role == 'Doctor':
+        patient = db.execute("SELECT * FROM patients WHERE patient_id=?", (patient_id,)).fetchone()
+    else:
+        patient = db.execute("SELECT * FROM patients WHERE patient_id=?", (patient_id,)).fetchone()
+    
+    if not patient:
+        db.close()
+        return "Access denied or patient not found", 403
+    
+    # Get messages for this patient
+    msgs = db.execute("""
+        SELECT m.*, u.name as sender_name, u.role as sender_role
+        FROM messages m
+        JOIN users u ON m.sender_username = u.username
+        WHERE m.patient_id = ?
+        ORDER BY m.timestamp ASC
+    """, (patient_id,)).fetchall()
+    
+    # Get pinned instructions (latest from doctor)
+    pinned = db.execute("""
+        SELECT m.message, m.timestamp, u.name as doctor_name
+        FROM messages m
+        JOIN users u ON m.sender_username = u.username
+        WHERE m.patient_id = ? AND m.is_instruction = 1 AND u.role = 'Doctor'
+        ORDER BY m.timestamp DESC LIMIT 1
+    """, (patient_id,)).fetchone()
+    
+    db.close()
+    
+    msg_html = "".join(f"""
+      <div class="msg {'msg-sent' if m['sender_username'] == user else 'msg-recv'}">
+        <div class="msg-hdr">
+          <strong>{m['sender_name']}</strong> ({m['sender_role']})
+          <small>{m['timestamp']}</small>
+        </div>
+        <div class="msg-body">{m['message']}</div>
+      </div>""" for m in msgs) or '<p class="empty">No messages yet.</p>'
+    
+    pinned_html = ""
+    if pinned:
+        pinned_html = f"""
+        <div class="pinned-note">
+          <i class="fas fa-thumbtack"></i>
+          <strong>Doctor's Instructions:</strong> {pinned['message']}
+          <br><small>By {pinned['doctor_name']} on {pinned['timestamp']}</small>
+        </div>"""
+    
+    body = f"""
+    <div class="page-hdr">
+      <h2><i class="fas fa-comments"></i> Messages for {patient['name']} ({patient_id})</h2>
+      <a href="javascript:history.back()" class="btn btn-s">
+        <i class="fas fa-arrow-left"></i> Back
+      </a>
+    </div>
+    
+    {pinned_html}
+    
+    <div class="panel">
+      <div class="panel-hdr"><i class="fas fa-envelope"></i> Message History</div>
+      <div class="panel-body msg-thread">{msg_html}</div>
+    </div>
+    
+    <div class="panel">
+      <div class="panel-hdr"><i class="fas fa-edit"></i> Send Message</div>
+      <div class="panel-body">
+        <textarea id="msgText" class="fc" rows="3" placeholder="Type your message..."></textarea>
+        <br><br>
+        <label><input type="checkbox" id="isInstruction"> Pin as instruction (Doctors only)</label>
+        <br><br>
+        <button class="btn btn-p" onclick="sendMessage('{patient_id}')">
+          <i class="fas fa-paper-plane"></i> Send Message
+        </button>
+      </div>
+    </div>
+    
+    <script>
+    async function sendMessage(pid){{
+      const msg = document.getElementById('msgText').value.trim();
+      const isInst = document.getElementById('isInstruction').checked ? 1 : 0;
+      if(!msg){{showToast('Please enter a message.','err');return;}}
+      const res = await fetch('/api/send-message', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{patient_id: pid, message: msg, is_instruction: isInst}})
+      }});
+      const d = await res.json();
+      if(d.success){{
+        document.getElementById('msgText').value = '';
+        location.reload();
+      }} else {{
+        showToast(d.error || 'Failed to send message.','err');
+      }}
+    }}
+    </script>
+    """
+    return page("Messages", body)
+
+@app.route("/api/send-message", methods=["POST"])
+@login_required
+def api_send_message():
+    """Send a message for a patient."""
+    data = request.get_json()
+    patient_id = data.get('patient_id')
+    message = data.get('message')
+    is_instruction = data.get('is_instruction', 0)
+    
+    if not patient_id or not message:
+        return jsonify({"success": False, "error": "Patient ID and message required"})
+    
+    db = get_db()
+    user = session['username']
+    role = session['role']
+    
+    # Determine receiver
+    patient = db.execute("SELECT assigned_to, assigned_by FROM patients WHERE patient_id=?", (patient_id,)).fetchone()
+    if not patient:
+        db.close()
+        return jsonify({"success": False, "error": "Patient not found"})
+    
+    if role == 'Doctor':
+        receiver = patient['assigned_to']
+    elif role == 'Nurse':
+        receiver = patient['assigned_by']
+        if not receiver:
+            # fallback for older patients missing assigned doctor records
+            if user == 'nurse.anna':
+                receiver = 'dr.smith'
+            elif user == 'nurse.bob':
+                receiver = 'dr.jones'
+            else:
+                first_doc = db.execute("SELECT username FROM users WHERE role='Doctor' ORDER BY username LIMIT 1").fetchone()
+                receiver = first_doc['username'] if first_doc else None
+    else:
+        db.close()
+        return jsonify({"success": False, "error": "Unauthorized"})
+    
+    if not receiver:
+        db.close()
+        return jsonify({"success": False, "error": "No doctor assigned to this patient"})
+    
+    # Only doctors can pin instructions
+    if is_instruction and role != 'Doctor':
+        is_instruction = 0
+    
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    db.execute("""
+        INSERT INTO messages (patient_id, sender_username, receiver_username, message, is_instruction, timestamp)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (patient_id, user, receiver, message, is_instruction, ts))
+    db.commit()
+    db.close()
+    
+    return jsonify({"success": True})
 
 def cleanup_duplicate_predictions():
     """Remove duplicate demo predictions, keeping only the most recent for each patient."""
